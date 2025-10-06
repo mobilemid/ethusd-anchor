@@ -1,52 +1,88 @@
 name: ETH Snapshot → Repo
 
 on:
-  workflow_dispatch: {}
+  # Run every hour at :32 *UTC*. The job itself filters to 01/07/13/19 Chicago time.
   schedule:
-    - cron: "32 * * * *"   # every hour at :32 UTC; we filter to Chicago hours
+    - cron: '32 * * * *'
+  workflow_dispatch:  # allow manual runs
+  push:
+    branches: [ main ]  # optional; useful while iterating
 
 permissions:
-  contents: write
+  contents: write  # required so Actions can commit to the repo
+
+concurrency:
+  group: eth-anchor
+  cancel-in-progress: false
+
+env:
+  SNAPSHOT_URL: https://ethusd-anchor.vercel.app/api/eth-snapshot
 
 jobs:
-  run:
+  snapshot:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: Compute Chicago time
         id: tz
         run: |
-          echo "NOW=$(TZ=America/Chicago date -Iseconds)" >> $GITHUB_OUTPUT
-          echo "HOUR=$(TZ=America/Chicago date +%H)" >> $GITHUB_OUTPUT
+          echo "NOW=$(TZ=America/Chicago date -Iseconds)" >> "$GITHUB_OUTPUT"
+          echo "HOUR=$(TZ=America/Chicago date +%H)"     >> "$GITHUB_OUTPUT"
 
-      - name: Fetch snapshot
+      - name: Fetch snapshot (4× daily or manual)
+        id: fetch
         if: contains('01,07,13,19', steps.tz.outputs.HOUR) || github.event_name == 'workflow_dispatch'
         run: |
+          set -euo pipefail
           mkdir -p data
-          curl -sS https://ethusd-anchor.vercel.app/api/eth-snapshot -o data/latest_eth_snapshot.json
+          # Pull the enriched JSON from your Vercel function
+          curl -fsSL "$SNAPSHOT_URL" -o data/latest_eth_snapshot.json
+
+          # If this is the very first run, seed the CSV header
           if [ ! -f data/anchor_log.csv ]; then
             echo "ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct" > data/anchor_log.csv
           fi
-          jq -r --arg ts "${{ steps.tz.outputs.NOW }}" '
-            [$ts,
-             .anchor.price,
-             .anchor.used,
-             (.anchor.anchor_age_seconds // ""),
-             (.cross_check.price // ""),
-             (.cross_check.discrepancy.level // ""),
-             (.cross_check.discrepancy.diff_pct // "")]
-          | @csv' data/latest_eth_snapshot.json >> data/anchor_log.csv
 
-      - name: Commit & push
-        if: contains('01,07,13,19', steps.tz.outputs.HOUR) || github.event_name == 'workflow_dispatch'
+          # Append one CSV row using the current Chicago timestamp
+          jq -r --arg ts "${{ steps.tz.outputs.NOW }}" '
+            [
+              $ts,
+              .anchor.price,
+              .anchor.used,
+              (.anchor.anchor_age_seconds // ""),
+              (.cross_check.price // ""),
+              (.cross_check.discrepancy.level // ""),
+              (.cross_check.discrepancy.diff_pct // "")
+            ] | @csv
+          ' data/latest_eth_snapshot.json >> data/anchor_log.csv
+
+      - name: Commit & push (only when we fetched)
+        if: steps.fetch.outcome == 'success'
         run: |
-          git config user.name "github-actions[bot]"
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add data/latest_eth_snapshot.json data/anchor_log.csv
-          git commit -m "snapshot: ${{ steps.tz.outputs.NOW }} CT" || exit 0
-          git push
+
+          # Commit only if there are changes
+          if ! git diff --cached --quiet; then
+            git commit -m "snapshot: ${{ steps.tz.outputs.NOW }} CT"
+            git push
+          else
+            echo "No changes to commit."
+          fi
