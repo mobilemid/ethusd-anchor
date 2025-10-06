@@ -1,15 +1,15 @@
 name: ETH Snapshot → Repo
 
 on:
-  # Run every hour at :32 *UTC*. The job itself filters to 01/07/13/19 Chicago time.
+  # Run every hour at :32 *UTC*. Job filters to 01/07/13/19 Chicago time.
   schedule:
     - cron: '32 * * * *'
-  workflow_dispatch:  # allow manual runs
+  workflow_dispatch:
   push:
-    branches: [ main ]  # optional; useful while iterating
+    branches: [ main ]
 
 permissions:
-  contents: write  # required so Actions can commit to the repo
+  contents: write
 
 concurrency:
   group: eth-anchor
@@ -43,21 +43,45 @@ jobs:
           echo "NOW=$(TZ=America/Chicago date -Iseconds)" >> "$GITHUB_OUTPUT"
           echo "HOUR=$(TZ=America/Chicago date +%H)"     >> "$GITHUB_OUTPUT"
 
-      - name: Fetch snapshot (4× daily or manual)
+      # Hardened fetch: retries + validation; never fails the whole job
+      - name: Fetch snapshot (4× daily or manual, with retry/validate)
         id: fetch
         if: contains('01,07,13,19', steps.tz.outputs.HOUR) || github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           mkdir -p data
-          # Pull the enriched JSON from your Vercel function
-          curl -fsSL "$SNAPSHOT_URL" -o data/latest_eth_snapshot.json
+          TMP=data/_snapshot_tmp.json
 
-          # If this is the very first run, seed the CSV header
+          echo "Fetching $SNAPSHOT_URL with retries..."
+          ok=0
+          for i in 1 2 3 4 5 6; do
+            # Use curl with status code capture and no cached response
+            code=$(curl -sS -w '%{http_code}' -H 'Cache-Control: no-cache' \
+                        --connect-timeout 10 --max-time 25 \
+                        --retry 3 --retry-all-errors \
+                        -o "$TMP" "$SNAPSHOT_URL" || true)
+
+            if [ "$code" = "200" ] && jq -e '.anchor.price|numbers' "$TMP" > /dev/null 2>&1; then
+              ok=1
+              break
+            fi
+            echo "Attempt $i failed (HTTP=$code). Sleeping $((i*i))s..."
+            sleep $((i*i))
+          done
+
+          if [ "$ok" = "0" ]; then
+            echo "::warning::Snapshot fetch/validate failed; skipping commit this run."
+            echo "fetch_status=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Persist: pretty JSON for diffs, plus append CSV row
+          jq --sort-keys '.' "$TMP" > data/latest_eth_snapshot.json
+
           if [ ! -f data/anchor_log.csv ]; then
             echo "ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct" > data/anchor_log.csv
           fi
 
-          # Append one CSV row using the current Chicago timestamp
           jq -r --arg ts "${{ steps.tz.outputs.NOW }}" '
             [
               $ts,
@@ -70,8 +94,10 @@ jobs:
             ] | @csv
           ' data/latest_eth_snapshot.json >> data/anchor_log.csv
 
-      - name: Commit & push (only when we fetched)
-        if: steps.fetch.outcome == 'success'
+          echo "fetch_status=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Commit & push (only when fetch succeeded)
+        if: steps.fetch.outputs.fetch_status == 'ok'
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
@@ -79,7 +105,6 @@ jobs:
 
           git add data/latest_eth_snapshot.json data/anchor_log.csv
 
-          # Commit only if there are changes
           if ! git diff --cached --quiet; then
             git commit -m "snapshot: ${{ steps.tz.outputs.NOW }} CT"
             git push
