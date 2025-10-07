@@ -27,7 +27,7 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Gate to 01/07/13/19:35 CT (early-wait, late-grace)
+      - name: Gate to 01/07/13/19:35 CT (early-wait, early-skip, late-grace)
         id: gate
         shell: bash
         run: |
@@ -44,15 +44,22 @@ jobs:
             TOM=$(TZ=America/Chicago date -d 'tomorrow' +%Y-%m-%d)
             TARGET=$(TZ=America/Chicago date -d "$TOM 01:35:00" +%s)
           fi
-          MAX_EARLY=600   # wait up to 10m if early
-          MAX_LATE=300    # allow up to 5m late
+
+          MAX_EARLY=600   # ≤10m early => sleep; >10m early => skip
+          MAX_LATE=300    # ≤5m late => proceed; >5m late => skip
+
           if [ $TARGET -gt $NOW_CT ]; then
             SLEEP=$(( TARGET - NOW_CT ))
             if [ $SLEEP -le $MAX_EARLY ]; then
               echo "Early by ${SLEEP}s — sleeping to hit anchor…"
               sleep $SLEEP
+            else
+              echo "Too early by ${SLEEP}s (> ${MAX_EARLY}). Skipping."
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
             fi
           fi
+
           NOW2=$(TZ=America/Chicago date +%s)
           LAG=$(( NOW2 - TARGET ))
           if [ $LAG -gt $MAX_LATE ]; then
@@ -60,6 +67,7 @@ jobs:
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
+
           echo "skip=false" >> $GITHUB_OUTPUT
           echo "target_epoch=$TARGET" >> $GITHUB_OUTPUT
           echo "lag_sec=$LAG" >> $GITHUB_OUTPUT
@@ -101,6 +109,7 @@ jobs:
              | .clock.anchor_lag_sec = $anchor_lag_sec
           ' "$TMP" | jq --sort-keys '.' > data/latest_eth_snapshot.json
 
+          # Append/update CSV log
           if [ ! -f data/anchor_log.csv ]; then
             echo "ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct,anchor_lag_sec" > data/anchor_log.csv
           fi
