@@ -1,12 +1,9 @@
 name: ETH Snapshot → Repo
 
 on:
-  # Run every hour at :32 *UTC*. Job filters to 01/07/13/19 Chicago time.
-  schedule:
-    - cron: '32 * * * *'
   workflow_dispatch:
-  push:
-    branches: [ main ]
+  schedule:
+    - cron: "*/5 * * * *"   # wake every 5 min
 
 permissions:
   contents: write
@@ -21,68 +18,93 @@ env:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
 
       - name: Install jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Compute Chicago time
-        id: tz
+      - name: Gate to 01/07/13/19:35 CT (early-wait, late-grace)
+        id: gate
+        shell: bash
         run: |
-          echo "NOW=$(TZ=America/Chicago date -Iseconds)" >> "$GITHUB_OUTPUT"
-          echo "HOUR=$(TZ=America/Chicago date +%H)"     >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          NOW_CT=$(TZ=America/Chicago date +%s)
+          TODAY=$(TZ=America/Chicago date +%Y-%m-%d)
+          H=("01" "07" "13" "19")
+          TARGET=""
+          for hh in "${H[@]}"; do
+            t=$(TZ=America/Chicago date -d "$TODAY $hh:35:00" +%s)
+            if [ "$NOW_CT" -le "$t" ]; then TARGET="$t"; break; fi
+          done
+          if [ -z "$TARGET" ]; then
+            TOM=$(TZ=America/Chicago date -d 'tomorrow' +%Y-%m-%d)
+            TARGET=$(TZ=America/Chicago date -d "$TOM 01:35:00" +%s)
+          fi
+          MAX_EARLY=600   # wait up to 10m if early
+          MAX_LATE=300    # allow up to 5m late
+          if [ $TARGET -gt $NOW_CT ]; then
+            SLEEP=$(( TARGET - NOW_CT ))
+            if [ $SLEEP -le $MAX_EARLY ]; then
+              echo "Early by ${SLEEP}s — sleeping to hit anchor…"
+              sleep $SLEEP
+            fi
+          fi
+          NOW2=$(TZ=America/Chicago date +%s)
+          LAG=$(( NOW2 - TARGET ))
+          if [ $LAG -gt $MAX_LATE ]; then
+            echo "Too late (lag=${LAG}s > ${MAX_LATE}s). Skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "skip=false" >> $GITHUB_OUTPUT
+          echo "target_epoch=$TARGET" >> $GITHUB_OUTPUT
+          echo "lag_sec=$LAG" >> $GITHUB_OUTPUT
+          echo "ts_ct=$(TZ=America/Chicago date --iso-8601=seconds)" >> $GITHUB_OUTPUT
 
-      # Hardened fetch: retries + validation; never fails the whole job
-      - name: Fetch snapshot (4× daily or manual, with retry/validate)
+      - name: Fetch snapshot (retry + cache-buster + validate)
         id: fetch
-        if: contains('01,07,13,19', steps.tz.outputs.HOUR) || github.event_name == 'workflow_dispatch'
+        if: steps.gate.outputs.skip != 'true'
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p data
           TMP=data/_snapshot_tmp.json
-
-          echo "Fetching $SNAPSHOT_URL with retries..."
           ok=0
           for i in 1 2 3 4 5 6; do
-            # Use curl with status code capture and no cached response
-            code=$(curl -sS -w '%{http_code}' -H 'Cache-Control: no-cache' \
-                        --connect-timeout 10 --max-time 25 \
-                        --retry 3 --retry-all-errors \
-                        -o "$TMP" "$SNAPSHOT_URL" || true)
-
-            if [ "$code" = "200" ] && jq -e '.anchor.price|numbers' "$TMP" > /dev/null 2>&1; then
-              ok=1
-              break
+            code=$(curl -sS -w '%{http_code}' \
+                     -H 'Cache-Control: no-cache' \
+                     --connect-timeout 10 --max-time 25 \
+                     --retry 3 --retry-all-errors \
+                     -o "$TMP" "$SNAPSHOT_URL?t=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${i}" || true)
+            if [ "$code" = "200" ] && jq -e '.anchor.price|numbers' "$TMP" >/dev/null 2>&1; then
+              ok=1; break
             fi
-            echo "Attempt $i failed (HTTP=$code). Sleeping $((i*i))s..."
+            echo "Attempt $i failed (HTTP=$code). Sleeping $((i*i))s…"
             sleep $((i*i))
           done
-
           if [ "$ok" = "0" ]; then
-            echo "::warning::Snapshot fetch/validate failed; skipping commit this run."
-            echo "fetch_status=skipped" >> "$GITHUB_OUTPUT"
+            echo "::warning::Fetch/validate failed; skipping commit."
+            echo "fetch_status=skipped" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Persist: pretty JSON for diffs, plus append CSV row
-          jq --sort-keys '.' "$TMP" > data/latest_eth_snapshot.json
+          # Inject clock diagnostics to guarantee a diff and aid freshness checks
+          jq --arg ts "${{ steps.gate.outputs.ts_ct }}" \
+             --argjson anchor_target_epoch ${{ steps.gate.outputs.target_epoch }} \
+             --argjson anchor_lag_sec ${{ steps.gate.outputs.lag_sec }} '
+             .clock.ts_ct = $ts
+             | .clock.anchor_target_epoch = $anchor_target_epoch
+             | .clock.anchor_lag_sec = $anchor_lag_sec
+          ' "$TMP" | jq --sort-keys '.' > data/latest_eth_snapshot.json
 
           if [ ! -f data/anchor_log.csv ]; then
-            echo "ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct" > data/anchor_log.csv
+            echo "ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct,anchor_lag_sec" > data/anchor_log.csv
           fi
-
-          jq -r --arg ts "${{ steps.tz.outputs.NOW }}" '
+          jq -r --arg ts "${{ steps.gate.outputs.ts_ct }}" --arg lag "${{ steps.gate.outputs.lag_sec }}" '
             [
               $ts,
               .anchor.price,
@@ -90,24 +112,18 @@ jobs:
               (.anchor.anchor_age_seconds // ""),
               (.cross_check.price // ""),
               (.cross_check.discrepancy.level // ""),
-              (.cross_check.discrepancy.diff_pct // "")
+              (.cross_check.discrepancy.diff_pct // ""),
+              $lag
             ] | @csv
           ' data/latest_eth_snapshot.json >> data/anchor_log.csv
+          echo "fetch_status=ok" >> $GITHUB_OUTPUT
 
-          echo "fetch_status=ok" >> "$GITHUB_OUTPUT"
-
-      - name: Commit & push (only when fetch succeeded)
+      - name: Commit & push
         if: steps.fetch.outputs.fetch_status == 'ok'
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add data/latest_eth_snapshot.json data/anchor_log.csv
-
-          if ! git diff --cached --quiet; then
-            git commit -m "snapshot: ${{ steps.tz.outputs.NOW }} CT"
-            git push
-          else
-            echo "No changes to commit."
-          fi
+          git commit -m "snapshot: ${{ steps.gate.outputs.ts_ct }} (lag=${{ steps.gate.outputs.lag_sec }}s)" || exit 0
+          git push
