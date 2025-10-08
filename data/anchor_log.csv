@@ -6,3 +6,4 @@ ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct
 "2025-10-06T14:45:10-05:00",4707.31,"last_trade","",4707.32,"none",0.00021243532670553773
 "2025-10-07T01:47:51-05:00",4672.96,"last_trade","",4672.3,"none",0.014124807656498685
 "2025-10-08T11:25:56-05:00",4461.74,"last_trade","",4461.75,"none",0.00022412755547926384,"-7744","false","local_timestamp not within ±10m of slot"
+"2025-10-08T15:43:47-05:00",4519.5,"last_trade","",4519.5,"none",0,"-13873","false","local_timestamp not within ±10m of slot"
