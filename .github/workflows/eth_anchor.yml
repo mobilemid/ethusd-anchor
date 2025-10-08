@@ -3,7 +3,7 @@ name: ETH Anchor → GitHub JSON
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/1 * * * *"  # wake every minute
+    - cron: "*/5 * * * *"    # wake every 5 min; gate below decides if we run
 
 permissions:
   contents: write
@@ -13,9 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CT_TZ: America/Chicago
-  CB_TICKER_URL: https://api.coinbase.com/api/v3/brokerage/products/ETH-USD/ticker
-  CB_BBA_URL: https://api.coinbase.com/api/v3/brokerage/best_bid_ask?product_ids=ETH-USD
+  SNAPSHOT_URL: https://ethusd-anchor.vercel.app/api/eth-snapshot
 
 jobs:
   anchor:
@@ -29,158 +27,104 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Gate to 01/07/13/19:35 CT (with early-wait and late-grace)
+      - name: Gate to 01/07/13/19:35 CT (early-wait, early-skip, late-grace)
         id: gate
         shell: bash
         run: |
           set -euo pipefail
-          NOW_CT=$(TZ=${{ env.CT_TZ }} date +%s)
-          TODAY=$(TZ=${{ env.CT_TZ }} date +%Y-%m-%d)
-          SLOTS=("01:35:00" "07:35:00" "13:35:00" "19:35:00")
+          NOW_CT=$(TZ=America/Chicago date +%s)
+          TODAY=$(TZ=America/Chicago date +%Y-%m-%d)
+          H=("01" "07" "13" "19")
           TARGET=""
-
-          for hhmmss in "${SLOTS[@]}"; do
-            t=$(TZ=${{ env.CT_TZ }} date -d "$TODAY $hhmmss" +%s)
+          for hh in "${H[@]}"; do
+            t=$(TZ=America/Chicago date -d "$TODAY $hh:35:00" +%s)
             if [ "$NOW_CT" -le "$t" ]; then TARGET="$t"; break; fi
           done
           if [ -z "$TARGET" ]; then
-            TOM=$(TZ=${{ env.CT_TZ }} date -d 'tomorrow' +%Y-%m-%d)
-            TARGET=$(TZ=${{ env.CT_TZ }} date -d "$TOM 01:35:00" +%s)
+            TOM=$(TZ=America/Chicago date -d 'tomorrow' +%Y-%m-%d)
+            TARGET=$(TZ=America/Chicago date -d "$TOM 01:35:00" +%s)
           fi
-
-          MAX_EARLY=1200  # up to 20m early → wait
-          MAX_LATE=1200   # up to 20m late → still proceed
-
+          MAX_EARLY=600   # we will sleep at most 10m if we woke up early
+          MAX_LATE=300    # allow up to 5m late
           if [ $TARGET -gt $NOW_CT ]; then
             SLEEP=$(( TARGET - NOW_CT ))
             if [ $SLEEP -le $MAX_EARLY ]; then
-              echo "Early by ${SLEEP}s — sleeping to hit the slot…"
+              echo "Early by ${SLEEP}s — sleeping to hit anchor…"
               sleep $SLEEP
+            else
+              echo "Too early by ${SLEEP}s (> ${MAX_EARLY}). Skipping."
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
             fi
           fi
-
-          NOW2=$(TZ=${{ env.CT_TZ }} date +%s)
+          NOW2=$(TZ=America/Chicago date +%s)
           LAG=$(( NOW2 - TARGET ))
           if [ $LAG -gt $MAX_LATE ]; then
-            echo "Too late (lag=${LAG}s > ${MAX_LATE}s). Skipping run."
+            echo "Too late (lag=${LAG}s > ${MAX_LATE}s). Skipping."
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
-
           echo "skip=false" >> $GITHUB_OUTPUT
           echo "target_epoch=$TARGET" >> $GITHUB_OUTPUT
           echo "lag_sec=$LAG" >> $GITHUB_OUTPUT
-          echo "ts_ct=$(TZ=${{ env.CT_TZ }} date --iso-8601=seconds)" >> $GITHUB_OUTPUT
+          echo "ts_ct=$(TZ=America/Chicago date --iso-8601=seconds)" >> $GITHUB_OUTPUT
 
-      - name: Fetch Coinbase Advanced Trade ticker x3 (median) with mid fallback
-        id: anchor
+      - name: Fetch Vercel anchor (retry + cache-buster + validate)
+        id: fetch
         if: steps.gate.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
-
-          fetch_ticker () {
-            curl -sS -H 'Accept: application/json' \
-                 -H 'Cache-Control: no-cache' \
-                 --connect-timeout 10 --max-time 20 \
-                 "${{ env.CB_TICKER_URL }}"
-          }
-
-          # Take 3 samples ~1s apart
-          T1=$(fetch_ticker)
-          sleep 1
-          T2=$(fetch_ticker)
-          sleep 1
-          T3=$(fetch_ticker)
-
-          # Validate JSONs contain price and time
-          for X in "$T1" "$T2" "$T3"; do
-            echo "$X" | jq -e '.price|numbers and .time' >/dev/null
-          done
-
-          # Extract prices and Coinbase server times
-          P1=$(echo "$T1" | jq -r '.price')
-          P2=$(echo "$T2" | jq -r '.price')
-          P3=$(echo "$T3" | jq -r '.price')
-
-          # Median
-          MEDIAN=$(printf "%s\n%s\n%s\n" "$P1" "$P2" "$P3" | sort -n | sed -n '2p')
-
-          # Use the most recent ticker for "as_of" (third)
-          ASOF=$(echo "$T3" | jq -r '.time')
-
-          # Compute anchor age vs now (server time may be RFC3339 or epoch ms)
-          NOW_UNIX=$(date +%s)
-          # Try parse ASOF as RFC3339 first, else epoch ms
-          if date -d "$ASOF" +%s >/dev/null 2>&1; then
-            ASOF_UNIX=$(date -d "$ASOF" +%s)
-          else
-            # assume ms epoch
-            ASOF_UNIX=$(( ${ASOF%%.*} / 1000 ))
-          fi
-          AGE=$(( NOW_UNIX - ASOF_UNIX ))
-
-          # If last trade appears stale (>10s), fetch best bid/ask mid
-          USED="last_trade"
-          MID=""
-          if [ "$AGE" -gt 10 ] || [ -z "$MEDIAN" ]; then
-            echo "Ticker appears stale (age=${AGE}s) or invalid — using best bid/ask mid."
-            BBA=$(curl -sS -H 'Accept: application/json' \
-                       -H 'Cache-Control: no-cache' \
-                       --connect-timeout 10 --max-time 20 \
-                       "${{ env.CB_BBA_URL }}")
-            # shape: { "pricebooks": [ { "product_id": "ETH-USD", "bids":[{"price":...}], "asks":[{"price":...}] } ] }
-            BID=$(echo "$BBA" | jq -r '.pricebooks[0].bids[0].price')
-            ASK=$(echo "$BBA" | jq -r '.pricebooks[0].asks[0].price')
-            if [ -n "$BID" ] && [ -n "$ASK" ]; then
-              MID=$(awk -v b="$BID" -v a="$ASK" 'BEGIN{printf "%.2f", (b+a)/2}')
-              MEDIAN="$MID"
-              USED="mid_best_bid_ask"
-            else
-              echo "::error::Failed to read best bid/ask from Advanced Trade."
-              exit 1
-            fi
-          fi
-
-          # Build JSON
           mkdir -p data
-          OUT=data/latest_eth_snapshot.json
+          TMP=data/_anchor_tmp.json
+          ok=0
+          for i in {1..18}; do   # up to ~90s total (18 * 5s)
+            code=$(curl -sS -w '%{http_code}' \
+                     -H 'Cache-Control: no-cache' \
+                     -H 'Accept: application/json' \
+                     --connect-timeout 10 --max-time 25 \
+                     --retry 2 --retry-all-errors \
+                     -o "$TMP" "$SNAPSHOT_URL?t=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${i}" || true)
 
-          # Note: TradingView cross-check is intentionally marked unavailable here
-          # (TV has no stable public JSON). You can add a second source later.
-          jq -n --arg ts_ct "${{ steps.gate.outputs.ts_ct }}" \
-                --arg used "$USED" \
-                --arg price "$MEDIAN" \
-                --arg asof "$ASOF" \
-                --argjson age $AGE '
-            {
-              anchor: {
-                price: ($price|tonumber),
-                used: $used,
-                as_of: $asof
-              },
-              cross_check: {
-                source: "TRADINGVIEW_COINDBASE_ETHUSD",
-                status: "unavailable",
-                discrepancy: {
-                  level: "n/a",
-                  diff_pct: null
-                }
-              },
-              clock: {
-                ts_ct: $ts_ct
-              },
-              anchor_age_seconds: $age
-            }' | jq --sort-keys '.' > "$OUT"
+            # Must be 200 and have a numeric anchor.price
+            if [ "$code" = "200" ] && jq -e '.anchor.price|numbers' "$TMP" >/dev/null 2>&1; then
+              ok=1; break
+            fi
+            echo "Attempt $i: HTTP=$code; not valid yet. Sleeping 5s…"
+            sleep 5
+          done
+          if [ "$ok" = "0" ]; then
+            echo "::error::ANCHOR UNAVAILABLE (data integrity) — Vercel endpoint not fresh/valid after retries."
+            exit 1
+          fi
 
-          # Log line (CSV)
+          # Stamp clock diagnostics and sort keys (stable git diff)
+          jq --arg ts "${{ steps.gate.outputs.ts_ct }}" \
+             --argjson anchor_target_epoch ${{ steps.gate.outputs.target_epoch }} \
+             --argjson anchor_lag_sec ${{ steps.gate.outputs.lag_sec }} '
+             .clock.ts_ct = $ts
+             | .clock.anchor_target_epoch = $anchor_target_epoch
+             | .clock.anchor_lag_sec = $anchor_lag_sec
+          ' "$TMP" | jq --sort-keys '.' > data/latest_eth_snapshot.json
+
+          # Append to CSV audit
           if [ ! -f data/anchor_log.csv ]; then
             echo "ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct,anchor_lag_sec" > data/anchor_log.csv
           fi
-          echo "${{ steps.gate.outputs.ts_ct }},$MEDIAN,$USED,$AGE,,n/a,," >> data/anchor_log.csv
+          jq -r --arg ts "${{ steps.gate.outputs.ts_ct }}" --arg lag "${{ steps.gate.outputs.lag_sec }}" '
+            [
+              $ts,
+              .anchor.price,
+              .anchor.used,
+              (.anchor.anchor_age_seconds // ""),
+              (.cross_check.price // ""),
+              (.cross_check.discrepancy.level // ""),
+              (.cross_check.discrepancy.diff_pct // ""),
+              $lag
+            ] | @csv
+          ' data/latest_eth_snapshot.json >> data/anchor_log.csv
 
       - name: Commit & push
-        if: steps.gate.outputs.skip != 'true'
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
