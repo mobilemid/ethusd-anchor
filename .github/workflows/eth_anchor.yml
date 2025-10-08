@@ -1,9 +1,14 @@
 name: ETH Anchor → GitHub JSON
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"    # wake every 5 minutes
+    - cron: "*/5 * * * *"        # wake every 5 min
+  workflow_dispatch:
+    inputs:
+      force_commit:
+        description: "Commit even if snapshot is considered stale"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -14,176 +19,145 @@ concurrency:
 
 env:
   PRIMARY_URL: https://ethusd-anchor.vercel.app/api/eth-snapshot
-  FALLBACK_URL: https://raw.githubusercontent.com/mobilemid/ethusd-anchor/refs/heads/main/data/latest_eth_snapshot.json
+  FALLBACK_RAW: https://raw.githubusercontent.com/mobilemid/ethusd-anchor/refs/heads/main/data/latest_eth_snapshot.json
+  TZ: America/Chicago
 
 jobs:
   anchor:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           persist-credentials: true
+          fetch-depth: 0
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # Gate to 01/07/13/19:35 CT (sleep if <=10m early; allow 5m late)
       - name: Time gate (01/07/13/19:35 CT) with early-wait / late-grace
         id: gate
         shell: bash
         run: |
           set -euo pipefail
-          NOW_CT=$(TZ=America/Chicago date +%s)
-          TODAY=$(TZ=America/Chicago date +%F)
-          H=("01" "07" "13" "19")
-          TARGET=""
-          for hh in "${H[@]}"; do
-            t=$(TZ=America/Chicago date -d "$TODAY $hh:35:00" +%s)
-            if [ "$NOW_CT" -le "$t" ]; then TARGET="$t"; break; fi
+          NOW_CT=$(date +%s)
+          TODAY=$(date +%Y-%m-%d)
+          target=""
+          for hh in 01 07 13 19; do
+            t=$(date -d "$TODAY $hh:35:00" +%s)
+            if [ $NOW_CT -le $t ]; then target=$t; break; fi
           done
-          if [ -z "$TARGET" ]; then
-            TOM=$(TZ=America/Chicago date -d 'tomorrow' +%F)
-            TARGET=$(TZ=America/Chicago date -d "$TOM 01:35:00" +%s)
+          if [ -z "$target" ]; then
+            TOM=$(date -d 'tomorrow' +%Y-%m-%d)
+            target=$(date -d "$TOM 01:35:00" +%s)
           fi
-          MAX_EARLY=600   # wait up to 10m if early
-          MAX_LATE=300    # accept up to 5m late
-
-          if [ "$TARGET" -gt "$NOW_CT" ]; then
-            SLEEP=$(( TARGET - NOW_CT ))
-            if [ "$SLEEP" -le "$MAX_EARLY" ]; then
-              echo "Early by ${SLEEP}s — sleeping to hit slot…"
-              sleep "$SLEEP"
-            else
-              echo "Too early by ${SLEEP}s (> ${MAX_EARLY}). Skipping this tick."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+          early=$(( target - NOW_CT ))
+          if [ $early -gt 0 ] && [ $early -le 600 ]; then
+            echo "Early by ${early}s — sleeping to hit the slot…"
+            sleep $early
           fi
-
-          NOW2=$(TZ=America/Chicago date +%s)
-          LAG=$(( NOW2 - TARGET ))
-          if [ "$LAG" -gt "$MAX_LATE" ]; then
-            echo "Too late (lag=${LAG}s > ${MAX_LATE}s). Skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "slot_epoch=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "ts_ct=$(TZ=America/Chicago date --iso-8601=seconds)" >> "$GITHUB_OUTPUT"
+          LAG=$(( $(date +%s) - target ))
+          echo "slot_epoch=$target" >> $GITHUB_OUTPUT
+          echo "lag_sec=$LAG" >> $GITHUB_OUTPUT
+          echo "now_ct=$(date --iso-8601=seconds)" >> $GITHUB_OUTPUT
 
       - name: Fetch anchor (PRIMARY Vercel, fallback GitHub) + validate + freshness
         id: fetch
-        if: steps.gate.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p data
-          TMP=data/_anchor_tmp.json
+          OUT=data/latest_eth_snapshot.json
+          TMP=data/_tmp.json
 
-          # --- helper: validate that file looks like our schema
-          validate() {
-            jq -e '.anchor.price|numbers' "$1" >/dev/null 2>&1
+          get_json () {
+            url="$1"
+            curl -sS -w '%{http_code}' \
+              -H 'Cache-Control: no-cache' \
+              --connect-timeout 10 --max-time 25 \
+              -o "$TMP" "${url}?t=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)" || true
           }
 
-          # --- try PRIMARY (Vercel) up to 90s, 5s backoff
-          source="vercel"
           ok=0
-          for i in $(seq 1 18); do
-            curl -fsSL -H 'Cache-Control: no-cache' \
-              "${PRIMARY_URL}?t=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${i}" \
-              -o "$TMP" || true
-            if validate "$TMP"; then ok=1; break; fi
-            sleep 5
+          for i in 1 2 3 4 5 6; do
+            code=$(get_json "$PRIMARY_URL")
+            if [ "$code" = "200" ] && jq -e '.anchor.price|numbers' "$TMP" >/dev/null 2>&1; then ok=1; break; fi
+            echo "Vercel try $i failed (HTTP=$code). Sleep $((i*2))s…"
+            sleep $((i*2))
           done
 
-          # --- fallback to GitHub RAW if primary never validated
           if [ "$ok" = "0" ]; then
-            source="github-fallback"
-            curl -fsSL -H 'Cache-Control: no-cache' \
-              "${FALLBACK_URL}?cb=${GITHUB_RUN_ID}" -o "$TMP"
-            validate "$TMP"  # will throw if invalid
-          fi
-
-          # --- freshness checks
-          SLOT=${{ steps.gate.outputs.slot_epoch }}
-          fresh=false
-          reason=""
-
-          # prefer .clock.ts_ct if present
-          TS_STR=$(jq -r '.clock.ts_ct // empty' "$TMP")
-          if [ -n "$TS_STR" ]; then
-            GOT=$(TZ=America/Chicago date -d "$TS_STR" +%s)
-            if [ "$GOT" -ge "$SLOT" ]; then fresh=true; reason="clock.ts_ct>=slot"; fi
-          fi
-
-          if [ "$fresh" = "false" ]; then
-            LOC=$(jq -r '.anchor.local_timestamp // empty' "$TMP")
-            if [ -n "$LOC" ]; then
-              GOT=$(TZ=America/Chicago date -d "$LOC" +%s)
-              DELTA=$(( GOT - SLOT )); DELTA=${DELTA#-}
-              if [ "$DELTA" -le 600 ]; then fresh=true; reason="local_timestamp within ±10m"; fi
+            echo "PRIMARY failed; trying fallback RAW…"
+            code=$(curl -sS -w '%{http_code}' -o "$TMP" "$FALLBACK_RAW" || true)
+            if [ "$code" != "200" ] || ! jq -e '.anchor.price|numbers' "$TMP" >/dev/null 2>&1; then
+              echo "status=fail" >> $GITHUB_OUTPUT
+              echo "::error::Both sources failed (HTTP=$code)."
+              exit 0
             fi
           fi
 
-          if [ "$fresh" = "false" ]; then
-            AGE=$(jq -r '.anchor.anchor_age_seconds // empty' "$TMP" || true)
-            if [ -n "$AGE" ] && [ "$AGE" -le 1800 ]; then fresh=true; reason="anchor_age_seconds<=1800"; fi
+          slot=${{ steps.gate.outputs.slot_epoch }}
+          fresh="false"; fresh_reason="n/a"
+
+          ts_clock=$(jq -r '.clock.ts_ct // empty' "$TMP" || true)
+          if [ -n "$ts_clock" ]; then
+            t_epoch=$(date -d "$ts_clock" +%s || echo 0)
+            if [ "$t_epoch" -ge "$slot" ]; then fresh="true"; else fresh_reason="clock.ts_ct < slot"; fi
+          else
+            lt=$(jq -r '.anchor.local_timestamp // empty' "$TMP" || true)
+            if [ -n "$lt" ]; then
+              t_epoch=$(date -d "$lt" +%s || echo 0)
+              low=$(( slot - 600 )); high=$(( slot + 600 ))
+              if [ "$t_epoch" -ge "$low" ] && [ "$t_epoch" -le "$high" ]; then fresh="true"; else fresh_reason="local_timestamp not within ±10m of slot"; fi
+            else
+              age=$(jq -r '.anchor.anchor_age_seconds // 999999' "$TMP")
+              if [ "$age" != "null" ] && [ "$age" -le 1800 ]; then fresh="true"; else fresh_reason="age>1800s & no timestamps"; fi
+            fi
           fi
 
-          # --- inject clock/debug + canonicalize (guarantees a diff)
-          TS_CT=${{ steps.gate.outputs.ts_ct }}
-          jq --arg ts "$TS_CT" \
-             --arg src "$source" \
-             --arg run "${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
-             --argjson slot ${{ steps.gate.outputs.slot_epoch }} '
-               .clock.ts_ct = $ts
-             | .clock.anchor_target_epoch = $slot
-             | .debug.source = $src
-             | .debug.run_id = $run
-          ' "$TMP" | jq -S '.' > data/latest_eth_snapshot.json
+          jq \
+            --arg ts "${{ steps.gate.outputs.now_ct }}" \
+            --argjson slot $slot \
+            --argjson lag ${{ steps.gate.outputs.lag_sec }} \
+            --arg fresh "$fresh" \
+            --arg reason "$fresh_reason" \
+            '.clock.ts_ct=$ts
+             | .clock.anchor_target_epoch=$slot
+             | .clock.anchor_lag_sec=$lag
+             | .clock.fresh=$fresh
+             | .clock.fresh_reason=$reason' "$TMP" | jq --sort-keys '.' > "$OUT"
 
-          # --- append CSV log
+          echo "status=ok" >> $GITHUB_OUTPUT
+          echo "fresh=$fresh" >> $GITHUB_OUTPUT
+          echo "fresh_reason=$fresh_reason" >> $GITHUB_OUTPUT
+          echo "Snapshot fresh? $fresh ($fresh_reason)"
+
+          # Always append a CSV row for observability
           if [ ! -f data/anchor_log.csv ]; then
-            echo "ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct,source" > data/anchor_log.csv
+            echo "ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct,anchor_lag_sec,fresh,fresh_reason" > data/anchor_log.csv
           fi
-          jq -r --arg ts "$TS_CT" --arg src "$source" '
+          jq -r --arg ts "${{ steps.gate.outputs.now_ct }}" \
+                --arg lag "${{ steps.gate.outputs.lag_sec }}" \
+                --arg fr "$fresh" --arg rr "$fresh_reason" '
             [
-              $ts,
-              .anchor.price,
-              .anchor.used,
+              $ts, .anchor.price, .anchor.used,
               (.anchor.anchor_age_seconds // ""),
               (.cross_check.price // ""),
               (.cross_check.discrepancy.level // ""),
               (.cross_check.discrepancy.diff_pct // ""),
-              $src
-            ] | @csv
-          ' data/latest_eth_snapshot.json >> data/anchor_log.csv
+              $lag, $fr, $rr
+            ] | @csv' "$OUT" >> data/anchor_log.csv
 
-          echo "fresh=$fresh" >> "$GITHUB_OUTPUT"
-          echo "source=$source" >> "$GITHUB_OUTPUT"
-          echo "reason=${reason:-n/a}" >> "$GITHUB_OUTPUT"
-
-      - name: Show pending diff
-        if: steps.gate.outputs.skip != 'true'
+      - name: Commit & push
+        if: steps.fetch.outputs.status == 'ok' && (steps.fetch.outputs.fresh == 'true' || inputs.force_commit)
+        shell: bash
         run: |
-          git status -s
-          echo "--- files changed (staged after add) ---"
-          git add data/latest_eth_snapshot.json data/anchor_log.csv
-          git diff --cached --name-only || true
-
-      - name: Commit & push (only when fresh)
-        if: steps.fetch.outputs.fresh == 'true'
-        run: |
-          set -e
+          set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/latest_eth_snapshot.json data/anchor_log.csv
           if git diff --cached --quiet; then
-            echo "Nothing to commit (unexpected)."
-          else
-            git commit -m "snapshot: ${{ steps.gate.outputs.ts_ct }} src=${{ steps.fetch.outputs.source }} reason=${{ steps.fetch.outputs.reason }}"
-            git push
+            echo "No file changes to commit."
+            exit 0
           fi
+          git commit -m "snapshot: ${{ steps.gate.outputs.now_ct }} (fresh=${{ steps.fetch.outputs.fresh }} reason='${{ steps.fetch.outputs.fresh_reason }}')"
+          git push
