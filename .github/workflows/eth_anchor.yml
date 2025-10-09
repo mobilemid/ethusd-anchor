@@ -2,11 +2,11 @@ name: ETH Anchor → GitHub JSON
 
 on:
   schedule:
-    - cron: "1 * * * *"       # every hour at :01 UTC
+    - cron: "2 * * * *"   # run at :02 every hour (UTC minute 2 == :02 CT)
   workflow_dispatch:
     inputs:
       force_commit:
-        description: "Commit even if snapshot is stale or unchanged"
+        description: "Commit even if snapshot is considered stale"
         type: boolean
         default: false
 
@@ -26,8 +26,7 @@ jobs:
   anchor:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           persist-credentials: true
           fetch-depth: 0
@@ -35,101 +34,62 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Fetch anchor (PRIMARY Vercel → fallback RAW) and assess freshness
+      - name: Fetch anchor (PRIMARY Vercel, fallback GitHub) + annotate + log
         id: fetch
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p data
-          OUT='data/latest_eth_snapshot.json'
-          TMP='data/_tmp.json'
+          OUT=data/latest_eth_snapshot.json
+          TMP=data/_tmp.json
 
-          fetch_json () {
-            local url="$1"
-            curl -sS -H 'Cache-Control: no-cache' \
-                 --connect-timeout 10 --max-time 20 \
-                 -w '\n%{http_code}\n' \
-                 "${url}?t=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)" > "$TMP.resp" || true
-            tail -n1 "$TMP.resp" > "$TMP.code"
-            sed '$d' "$TMP.resp" > "$TMP"
+          get_json () {
+            url="$1"
+            curl -sS -w '%{http_code}' \
+              -H 'Cache-Control: no-cache' \
+              --connect-timeout 10 --max-time 25 \
+              -o "$TMP" "${url}?t=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)" || true
           }
 
           ok=0
-          for i in 1 2 3 4 5; do
-            fetch_json "$PRIMARY_URL"
-            code=$(cat "$TMP.code")
+          for i in 1 2 3 4 5 6; do
+            code=$(get_json "$PRIMARY_URL")
             if [ "$code" = "200" ] && jq -e '.anchor.price|numbers' "$TMP" >/dev/null 2>&1; then ok=1; break; fi
-            echo "Primary attempt $i failed (HTTP=$code). Sleeping $((i*2))s…"
+            echo "Vercel try $i failed (HTTP=$code). Sleep $((i*2))s…"
             sleep $((i*2))
           done
 
           if [ "$ok" = "0" ]; then
-            echo "Primary failed; trying fallback RAW…"
-            curl -sS -H 'Cache-Control: no-cache' --connect-timeout 10 --max-time 20 \
-                 -o "$TMP" "$FALLBACK_RAW" || true
-            if ! jq -e '.anchor.price|numbers' "$TMP" >/dev/null 2>&1; then
-              echo "status=fail" >> "$GITHUB_OUTPUT"
-              echo "::error::Both sources failed."
+            echo "PRIMARY failed; trying fallback RAW…"
+            code=$(curl -sS -w '%{http_code}' -o "$TMP" "$FALLBACK_RAW" || true)
+            if [ "$code" != "200" ] || ! jq -e '.anchor.price|numbers' "$TMP" >/dev/null 2>&1; then
+              echo "status=fail" >> $GITHUB_OUTPUT
+              echo "::error::Both sources failed (HTTP=$code)."
               exit 0
             fi
           fi
 
-          NOW_ISO=$(date --iso-8601=seconds)
-          NOW_EPOCH=$(date +%s)
-
-          fresh=false
-          reason="n/a"
-
-          ts_clock=$(jq -r '.clock.ts_ct // empty' "$TMP" || true)
-          if [ -n "$ts_clock" ]; then
-            te=$(date -d "$ts_clock" +%s || echo 0)
-            age=$(( NOW_EPOCH - te ))
-            if [ $age -le 900 ]; then fresh=true; else reason="clock.ts_ct age ${age}s > 900"; fi
-          else
-            lt=$(jq -r '.anchor.local_timestamp // empty' "$TMP" || true)
-            if [ -n "$lt" ]; then
-              te=$(date -d "$lt" +%s || echo 0)
-              age=$(( NOW_EPOCH - te ))
-              if [ $age -le 900 ]; then fresh=true; else reason="local_timestamp age ${age}s > 900"; fi
-            else
-              asec=$(jq -r '.anchor.anchor_age_seconds // empty' "$TMP" || true)
-              if [ -n "${asec:-}" ] && [ "$asec" != "null" ] && [ "$asec" -le 1800 ]; then fresh=true; else reason="no timestamps & anchor_age_seconds > 1800"; fi
-            fi
-          fi
-
+          NOW_CT="$(date --iso-8601=seconds)"
           jq \
-            --arg now "$NOW_ISO" \
-            --arg fresh "$fresh" \
-            --arg reason "$reason" \
-            --argjson now_epoch "$NOW_EPOCH" \
-            '
-            .clock.ts_ct = $now
-            | .clock.checked_epoch = $now_epoch
-            | .clock.fresh = ($fresh=="true")
-            | .clock.fresh_reason = $reason
-            ' "$TMP" | jq --sort-keys '.' > "$OUT"
+            --arg ts "$NOW_CT" \
+            '.clock.ts_ct=$ts' "$TMP" | jq --sort-keys '.' > "$OUT"
 
-          echo "status=ok" >> "$GITHUB_OUTPUT"
-          echo "fresh=$fresh" >> "$GITHUB_OUTPUT"
-          echo "fresh_reason=$reason" >> "$GITHUB_OUTPUT"
-          echo "Anchor: $(jq -r '.anchor.price' "$OUT") | fresh=$fresh ($reason) at $NOW_ISO"
+          echo "status=ok" >> $GITHUB_OUTPUT
 
+          # Append CSV row for observability
           if [ ! -f data/anchor_log.csv ]; then
-            echo "ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct,fresh,fresh_reason" > data/anchor_log.csv
+            echo "ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct" > data/anchor_log.csv
           fi
-          jq -r --arg ts "$NOW_ISO" --arg fr "$fresh" --arg rr "$reason" '
-            [ $ts,
-              .anchor.price,
-              .anchor.used,
+          jq -r --arg ts "$NOW_CT" '
+            [
+              $ts, .anchor.price, .anchor.used,
               (.anchor.anchor_age_seconds // ""),
               (.cross_check.price // ""),
               (.cross_check.discrepancy.level // ""),
-              (.cross_check.discrepancy.diff_pct // ""),
-              ($fr=="true"),
-              $rr
+              (.cross_check.discrepancy.diff_pct // "")
             ] | @csv' "$OUT" >> data/anchor_log.csv
 
-      - name: Commit & push (always write snapshot; freshness is annotated)
+      - name: Commit & push
         if: steps.fetch.outputs.status == 'ok' || inputs.force_commit
         shell: bash
         run: |
@@ -141,6 +101,5 @@ jobs:
             echo "No file changes to commit."
             exit 0
           fi
-          msg="snapshot: $(date --iso-8601=seconds) (fresh=${{ steps.fetch.outputs.fresh || 'false' }} reason='${{ steps.fetch.outputs.fresh_reason || 'unknown' }}')"
-          git commit -m "$msg"
+          git commit -m "snapshot: $(date --iso-8601=seconds)"
           git push
