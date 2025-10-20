@@ -13,10 +13,10 @@
     "venue": "Coinbase Advanced Trade REST"
   },
   "clock": {
-    "checked_epoch": 1760944723,
+    "checked_epoch": 1760948749,
     "fresh": false,
-    "fresh_reason": "clock.ts_ct age 3087s > 900",
-    "ts_ct": "2025-10-20T02:18:43-05:00"
+    "fresh_reason": "clock.ts_ct age 4026s > 900",
+    "ts_ct": "2025-10-20T03:25:49-05:00"
   },
   "cross_check": {
     "discrepancy": {
