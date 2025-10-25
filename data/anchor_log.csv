@@ -392,3 +392,4 @@ ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct
 "2025-10-25T11:20:11-05:00",3931,"last_trade","",3931,"none",0,false,"clock.ts_ct age 3891s > 900"
 "2025-10-25T12:14:31-05:00",3931,"last_trade","",3931,"none",0,false,"clock.ts_ct age 3260s > 900"
 "2025-10-25T13:22:57-05:00",3931,"last_trade","",3931,"none",0,false,"clock.ts_ct age 4106s > 900"
+"2025-10-25T14:13:42-05:00",3931,"last_trade","",3931,"none",0,false,"clock.ts_ct age 3045s > 900"
