@@ -908,3 +908,4 @@ ts_ct,anchor,used,age_sec,cross_price,disc_level,disc_diff_pct
 "2025-11-17T21:10:51-06:00",2969.32,"last_trade","",2969.3,"none",0.0006735571563757845,false,"local_timestamp age 1763435451s > 900"
 "2025-11-17T22:22:10-06:00",2993.4,"last_trade","",2994.51,"none",0.03707470553165052,false,"local_timestamp age 1763439730s > 900"
 "2025-11-17T23:18:03-06:00",3013,"last_trade","",3009.31,"minor",0.12254433929837737,false,"local_timestamp age 1763443083s > 900"
+"2025-11-18T00:27:13-06:00",3000.47,"last_trade","",3000.46,"none",0.00033328167466587785,false,"local_timestamp age 1763447233s > 900"
