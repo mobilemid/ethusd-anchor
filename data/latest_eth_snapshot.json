@@ -1,8 +1,8 @@
 {
   "anchor": {
     "anchor_age_seconds": null,
-    "local_timestamp": "12/31/2025, 9:19:09 AM",
-    "price": 2970.92,
+    "local_timestamp": "12/31/2025, 10:23:54 AM",
+    "price": 2985.97,
     "product": "ETH-USD",
     "server_timestamps": [
       null,
@@ -13,19 +13,19 @@
     "venue": "Coinbase Advanced Trade REST"
   },
   "clock": {
-    "checked_epoch": 1767194352,
+    "checked_epoch": 1767198236,
     "fresh": false,
-    "fresh_reason": "local_timestamp age 1767194352s > 900",
-    "ts_ct": "2025-12-31T09:19:12-06:00"
+    "fresh_reason": "local_timestamp age 1767198236s > 900",
+    "ts_ct": "2025-12-31T10:23:56-06:00"
   },
   "cross_check": {
     "discrepancy": {
-      "diff_pct": 0.002692732315478069,
+      "diff_pct": 0.004353599338256556,
       "level": "none"
     },
-    "price": 2971,
+    "price": 2986.1,
     "product": "ETH-USD",
-    "server_timestamp": "2025-12-31T15:19:11.909094022Z",
+    "server_timestamp": "2025-12-31T16:23:54.676960028Z",
     "venue": "Coinbase Exchange public ticker"
   },
   "ratios": {
