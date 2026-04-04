@@ -1,8 +1,8 @@
 {
   "anchor": {
     "anchor_age_seconds": null,
-    "local_timestamp": "4/4/2026, 2:49:47 AM",
-    "price": 2051.68,
+    "local_timestamp": "4/4/2026, 3:38:09 AM",
+    "price": 2052.38,
     "product": "ETH-USD",
     "server_timestamps": [
       null,
@@ -13,19 +13,19 @@
     "venue": "Coinbase Advanced Trade REST"
   },
   "clock": {
-    "checked_epoch": 1775288990,
+    "checked_epoch": 1775291892,
     "fresh": false,
-    "fresh_reason": "local_timestamp age 1775288990s > 900",
-    "ts_ct": "2026-04-04T02:49:50-05:00"
+    "fresh_reason": "local_timestamp age 1775291892s > 900",
+    "ts_ct": "2026-04-04T03:38:12-05:00"
   },
   "cross_check": {
     "discrepancy": {
       "diff_pct": 0,
       "level": "none"
     },
-    "price": 2051.68,
+    "price": 2052.38,
     "product": "ETH-USD",
-    "server_timestamp": "2026-04-04T07:49:45.194276343Z",
+    "server_timestamp": "2026-04-04T08:38:07.074041181Z",
     "venue": "Coinbase Exchange public ticker"
   },
   "ratios": {
